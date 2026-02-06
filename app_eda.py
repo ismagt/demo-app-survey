@@ -124,6 +124,60 @@ def select_filter(colname: str, df: pd.DataFrame):
     selected = st.sidebar.multiselect(colname, options, default=options)
     return selected
 
+import plotly.graph_objects as go
+
+def xtab_pct_df(df: pd.DataFrame, q: str, banner: str, drop_unknown=True) -> pd.DataFrame:
+    tmp = df[[q, banner]].copy()
+    tmp[q] = clean_cat_series(tmp[q])
+    tmp[banner] = clean_cat_series(tmp[banner])
+
+    if drop_unknown:
+        tmp = tmp[(tmp[q] != "Unknown") & (tmp[banner] != "Unknown")]
+
+    ct = pd.crosstab(tmp[q], tmp[banner], dropna=False)
+
+    # Column % (each banner col sums to 100)
+    col_sums = ct.sum(axis=0).replace(0, np.nan)
+    pct = (ct.div(col_sums, axis=1) * 100).round(1)
+
+    return pct  # rows = responses, cols = banner categories
+
+def plot_pct_heatmap(pct: pd.DataFrame, title: str, max_rows=25, max_cols=12):
+    # keep top rows/cols by mass to avoid unreadable plots
+    pct2 = pct.copy()
+
+    # reduce columns
+    if pct2.shape[1] > max_cols:
+        col_order = pct2.sum(axis=0).sort_values(ascending=False).index[:max_cols]
+        pct2 = pct2[col_order]
+
+    # reduce rows
+    if pct2.shape[0] > max_rows:
+        row_order = pct2.sum(axis=1).sort_values(ascending=False).index[:max_rows]
+        pct2 = pct2.loc[row_order]
+
+    z = pct2.values
+    text = np.vectorize(lambda x: "" if np.isnan(x) else f"{x:.1f}%")(z)
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=[str(c) for c in pct2.columns],
+            y=[str(r) for r in pct2.index],
+            text=text,
+            texttemplate="%{text}",
+            textfont={"size": 12},
+            hovertemplate="Row: %{y}<br>Col: %{x}<br>%: %{z:.1f}<extra></extra>",
+            colorbar={"title": "%"},
+        )
+    )
+    fig.update_layout(
+        title=title,
+        height=max(420, 28 * (pct2.shape[0] + 6)),
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
 
 # -----------------------------
 # UI: Sidebar
@@ -168,8 +222,9 @@ with st.expander("Preview data"):
 # -----------------------------
 # Tabs
 # -----------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Univariate", "Bivariate", "Correlations", "Geo / Map"])
-
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Univariate", "Bivariate", "Correlations", "Geo / Map", "XTab Report", "Visual XTab Matrix"
+])
 
 # -----------------------------
 # Tab 1: Univariate
@@ -352,3 +407,183 @@ with tab4:
             rc.columns = ["Region", "respondents"]
             st.dataframe(rc, use_container_width=True)
             robust_barh(rc["Region"], rc["respondents"], title="Respondents by Region", xlabel="Respondents")
+
+def clean_cat_series(s: pd.Series) -> pd.Series:
+    s = s.replace({np.nan: "Unknown"}).astype(str).str.strip()
+    return s.replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"})
+
+def xtab_percent_table(
+    df: pd.DataFrame,
+    row_var: str,
+    col_var: str,
+    drop_unknown_rows: bool = False,
+    drop_unknown_cols: bool = False,
+    sort_rows_by_total: bool = False,
+) -> pd.DataFrame:
+    """
+    Returns a table like:
+      - index: response options of row_var
+      - columns: banner categories of col_var + "Total"
+      - values: column percentages (each column sums to 100%)
+    """
+    tmp = df[[row_var, col_var]].copy()
+    tmp[row_var] = clean_cat_series(tmp[row_var])
+    tmp[col_var] = clean_cat_series(tmp[col_var])
+
+    if drop_unknown_rows:
+        tmp = tmp[tmp[row_var] != "Unknown"]
+    if drop_unknown_cols:
+        tmp = tmp[tmp[col_var] != "Unknown"]
+
+    # counts by banner
+    counts = pd.crosstab(tmp[row_var], tmp[col_var], dropna=False)
+
+    # add Total column (overall)
+    counts["Total"] = counts.sum(axis=1)
+
+    # column percentages (banner-wise)
+    col_sums = counts.sum(axis=0).replace(0, np.nan)
+    pct = (counts / col_sums) * 100
+    pct = pct.round(1)
+
+    # optional sort
+    if sort_rows_by_total:
+        pct = pct.sort_values("Total", ascending=False)
+
+    return pct
+
+def xtab_count_table(
+    df: pd.DataFrame,
+    row_var: str,
+    col_var: str,
+    drop_unknown_rows: bool = False,
+    drop_unknown_cols: bool = False,
+    sort_rows_by_total: bool = False,
+) -> pd.DataFrame:
+    tmp = df[[row_var, col_var]].copy()
+    tmp[row_var] = clean_cat_series(tmp[row_var])
+    tmp[col_var] = clean_cat_series(tmp[col_var])
+
+    if drop_unknown_rows:
+        tmp = tmp[tmp[row_var] != "Unknown"]
+    if drop_unknown_cols:
+        tmp = tmp[tmp[col_var] != "Unknown"]
+
+    counts = pd.crosstab(tmp[row_var], tmp[col_var], dropna=False)
+    counts["Total"] = counts.sum(axis=1)
+
+    if sort_rows_by_total:
+        counts = counts.sort_values("Total", ascending=False)
+
+    return counts
+
+# -----------------------------
+# Tab 5: XTab Report (readable % table like your example)
+# -----------------------------
+with tab5:
+    st.subheader("XTab Report (Percent tables by banner)")
+
+    cat_cols = df_f.select_dtypes(include=["object"]).columns.tolist()
+    if len(cat_cols) < 2:
+        st.info("Need at least two categorical columns to build an XTab.")
+    else:
+        # Suggested banners (edit this list to match your questionnaire)
+        default_banners = [c for c in [POSITION_COL, REGION_COL, AI_USE_COL, TRAINING_COL, YEARS_COL] if c in cat_cols]
+        banner = st.selectbox(
+            "Banner column (columns in the table)",
+            options=cat_cols,
+            index=cat_cols.index(default_banners[0]) if len(default_banners) else 0
+        )
+
+        question = st.selectbox(
+            "Question column (rows in the table)",
+            options=cat_cols,
+            index=cat_cols.index(REGION_COL) if REGION_COL in cat_cols else 0
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            drop_unknown_rows = st.checkbox("Drop Unknown (rows)", value=False)
+        with c2:
+            drop_unknown_cols = st.checkbox("Drop Unknown (banner cols)", value=False)
+        with c3:
+            sort_rows = st.checkbox("Sort rows by Total", value=False)
+
+        show_counts = st.checkbox("Show counts table too", value=True)
+
+        pct = xtab_percent_table(
+            df_f,
+            row_var=question,
+            col_var=banner,
+            drop_unknown_rows=drop_unknown_rows,
+            drop_unknown_cols=drop_unknown_cols,
+            sort_rows_by_total=sort_rows,
+        )
+
+        st.markdown("### Percent table (column %)")
+        st.dataframe(pct, use_container_width=True)
+
+        if show_counts:
+            cnt = xtab_count_table(
+                df_f,
+                row_var=question,
+                col_var=banner,
+                drop_unknown_rows=drop_unknown_rows,
+                drop_unknown_cols=drop_unknown_cols,
+                sort_rows_by_total=sort_rows,
+            )
+            st.markdown("### Count table")
+            st.dataframe(cnt, use_container_width=True)
+
+        st.caption("Interpretation: Each banner column sums to ~100% (distribution of the question within each subgroup).")
+
+# -----------------------------
+# Tab 6: Visual XTab Matrix (many-by-many, colored + %)
+# -----------------------------
+with tab6:
+    st.subheader("Visual XTab Matrix (colored % heatmaps)")
+
+    cat_cols = df_f.select_dtypes(include=["object"]).columns.tolist()
+    if len(cat_cols) < 2:
+        st.info("Need at least two categorical columns.")
+    else:
+        st.markdown("Pick a set of **Questions** (rows) and **Banners** (columns). The plot shows **column %**.")
+
+        # Good defaults for banners (edit to your dataset)
+        default_banners = [c for c in [REGION_COL, POSITION_COL, AI_USE_COL, TRAINING_COL, YEARS_COL] if c in cat_cols]
+        banners = st.multiselect(
+            "Banners (grouping variables)",
+            options=cat_cols,
+            default=default_banners[:3] if len(default_banners) else cat_cols[:2],
+        )
+
+        # Questions: you typically want multiple survey questions (exclude banners)
+        candidate_questions = [c for c in cat_cols if c not in set(banners)]
+        questions = st.multiselect(
+            "Questions (to cross vs each banner)",
+            options=candidate_questions,
+            default=candidate_questions[:3] if len(candidate_questions) >= 3 else candidate_questions,
+        )
+
+        drop_unknown = st.checkbox("Drop Unknown (recommended)", value=True)
+        max_rows = st.slider("Max response options (rows) per heatmap", 5, 60, 25)
+        max_cols = st.slider("Max banner categories (cols) per heatmap", 3, 30, 12)
+
+        if len(banners) == 0 or len(questions) == 0:
+            st.info("Select at least 1 banner and 1 question.")
+        else:
+            st.caption("Each heatmap: rows = response options, columns = banner categories, values = % within each banner column.")
+
+            for q in questions:
+                st.markdown(f"## {q}")
+                for b in banners:
+                    try:
+                        pct = xtab_pct_df(df_f, q=q, banner=b, drop_unknown=drop_unknown)
+                        plot_pct_heatmap(
+                            pct,
+                            title=f"{q}  ×  {b}  (column %)",
+                            max_rows=max_rows,
+                            max_cols=max_cols,
+                        )
+                    except Exception as e:
+                        st.warning(f"Could not plot {q} × {b}: {e}")
