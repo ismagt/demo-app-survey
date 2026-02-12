@@ -6,6 +6,12 @@ import matplotlib.pyplot as plt
 import plotly.express as px
 
 from scipy.stats import chi2_contingency
+from scipy.stats import spearmanr
+from io import BytesIO
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill
+
 
 # -----------------------------
 # Config
@@ -23,6 +29,163 @@ YEARS_COL = "How many years have you worked in a regulatory role with oversight 
 # If you want a world map WITHOUT pycountry, you need ISO3 codes already in your data
 ISO3_COL_CANDIDATES = ["iso3", "ISO3", "ISO_3", "country_iso3"]
 COUNTRY_NAME_CANDIDATES = ["Country", "country", "Primary Country", "Jurisdiction Country"]
+
+# -----------------------------
+# Grouping variables (Phase 1)
+# -----------------------------
+ROLE_GROUP_COL = "role_group"
+TENURE_GROUP_COL = "tenure_group"
+REGION_GROUP_COL = "region_group"  # e.g., US vs Other
+TRAINING_BIN_COL = "training_bin"  # Yes vs No
+
+GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")   # p<0.05
+YELLOW = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid") # p<0.10
+
+
+def build_corr_excel(r_mat: pd.DataFrame, p_mat: pd.DataFrame, n_mat: pd.DataFrame) -> bytes:
+    """
+    Excel with 3 sheets: Spearman_r (colored by p), Spearman_p, Pairwise_n
+    """
+    wb = Workbook()
+
+    # r sheet
+    ws = wb.active
+    ws.title = "Spearman_r"
+    ws.append([""] + list(r_mat.columns))
+    for idx in r_mat.index:
+        ws.append([idx] + [None if pd.isna(v) else float(v) for v in r_mat.loc[idx].values])
+
+    # fill based on p
+    for i in range(len(r_mat.index)):
+        for j in range(len(r_mat.columns)):
+            p = p_mat.iat[i, j]
+            cell = ws.cell(row=2 + i, column=2 + j)
+            if pd.isna(p):
+                continue
+            if p < 0.05:
+                cell.fill = GREEN
+            elif p < 0.10:
+                cell.fill = YELLOW
+
+    # p sheet
+    ws2 = wb.create_sheet("Spearman_p")
+    ws2.append([""] + list(p_mat.columns))
+    for idx in p_mat.index:
+        ws2.append([idx] + [None if pd.isna(v) else float(v) for v in p_mat.loc[idx].values])
+
+    # n sheet
+    ws3 = wb.create_sheet("Pairwise_n")
+    ws3.append([""] + list(n_mat.columns))
+    for idx in n_mat.index:
+        ws3.append([idx] + [None if pd.isna(v) else float(v) for v in n_mat.loc[idx].values])
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+def corr_heatmap_plotly(r_mat: pd.DataFrame, p_mat: pd.DataFrame, title: str):
+    """
+    Plotly heatmap with r text, and border-like significance encoding via text symbols.
+    - Green marker for p<0.05, Yellow marker for p<0.10
+    """
+    import plotly.graph_objects as go
+
+    r = r_mat.copy()
+    p = p_mat.copy()
+
+    z = r.values
+    sig = np.full(z.shape, "", dtype=object)
+    sig[p.values < 0.05] = "✓"      # significant
+    sig[(p.values >= 0.05) & (p.values < 0.10)] = "•"  # directional
+
+    text = np.empty(z.shape, dtype=object)
+    for i in range(z.shape[0]):
+        for j in range(z.shape[1]):
+            if np.isnan(z[i, j]):
+                text[i, j] = ""
+            else:
+                text[i, j] = f"{z[i, j]:.2f}{sig[i, j]}"
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=[str(c) for c in r.columns],
+            y=[str(i) for i in r.index],
+            text=text,
+            texttemplate="%{text}",
+            hovertemplate="Var1: %{y}<br>Var2: %{x}<br>r: %{z:.3f}<extra></extra>",
+            colorbar={"title": "Spearman r"},
+        )
+    )
+    fig.update_layout(
+        title=title,
+        height=max(520, 26 * (len(r.index) + 6)),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
+
+def clean_cat_series(s: pd.Series) -> pd.Series:
+    s = s.replace({np.nan: "Unknown"}).astype(str).str.strip()
+    return s.replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"})
+
+def recode_role(series: pd.Series) -> pd.Series:
+    s = clean_cat_series(series)
+    # Ajusta estos mapeos a tus labels reales
+    leadership = {"Executive Leadership", "Director", "Commissioner", "Chair", "CEO", "President"}
+    management = {"Management", "Manager", "Supervisor", "Team Lead"}
+    non_mgmt = {"Non-Management", "Analyst", "Specialist", "Staff", "Individual Contributor"}
+
+    def _map(x: str) -> str:
+        if x in leadership: return "Executive Leadership"
+        if x in management: return "Management"
+        if x in non_mgmt: return "Non-Management"
+        return "Other/Unknown"
+    return s.map(_map)
+
+def recode_training_yesno(series: pd.Series) -> pd.Series:
+    s = clean_cat_series(series).str.lower()
+    return s.map(lambda x: "Yes" if "yes" in x else ("No" if "no" in x else "Unknown"))
+
+def recode_region_us_other(series: pd.Series) -> pd.Series:
+    s = clean_cat_series(series).str.lower()
+    # Ajusta según cómo venga “United States” en tu data
+    return s.map(lambda x: "US" if ("united states" in x or x == "us" or "u.s." in x) else ("Other" if x != "unknown" else "Unknown"))
+
+def recode_tenure_5yrs(series: pd.Series) -> pd.Series:
+    s = clean_cat_series(series).str.lower()
+    # Ajusta según tus categorías reales (ej: "0-2 years", "3-5 years", "6-10 years", "10+")
+    less = {"0-2 years", "0–2 years", "1-2 years", "3-5 years", "3–5 years", "less than 5 years", "<5 years"}
+    more = {"6-10 years", "6–10 years", "10+ years", "10 years or more", "more than 5 years", ">5 years"}
+    def _map(x: str) -> str:
+        if x in less: return "<5 years"
+        if x in more: return ">=5 years"
+        return "Other/Unknown"
+    return s.map(_map)
+
+def add_group_vars(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    if POSITION_COL in df2.columns:
+        df2[ROLE_GROUP_COL] = recode_role(df2[POSITION_COL])
+    else:
+        df2[ROLE_GROUP_COL] = "Unknown"
+
+    if TRAINING_COL in df2.columns:
+        df2[TRAINING_BIN_COL] = recode_training_yesno(df2[TRAINING_COL])
+    else:
+        df2[TRAINING_BIN_COL] = "Unknown"
+
+    if REGION_COL in df2.columns:
+        df2[REGION_GROUP_COL] = recode_region_us_other(df2[REGION_COL])
+    else:
+        df2[REGION_GROUP_COL] = "Unknown"
+
+    if YEARS_COL in df2.columns:
+        df2[TENURE_GROUP_COL] = recode_tenure_5yrs(df2[YEARS_COL])
+    else:
+        df2[TENURE_GROUP_COL] = "Unknown"
+
+    return df2
 
 # -----------------------------
 # Helpers
@@ -178,6 +341,302 @@ def plot_pct_heatmap(pct: pd.DataFrame, title: str, max_rows=25, max_cols=12):
     )
     st.plotly_chart(fig, use_container_width=True)
 
+import re
+from collections import Counter
+
+def is_multiselect_col(s: pd.Series, sep=";") -> bool:
+    s2 = s.dropna().astype(str)
+    if s2.empty:
+        return False
+    # Heurística: si muchas filas contienen separador, es multi-select
+    return (s2.str.contains(re.escape(sep)).mean() >= 0.25)
+
+def multiselect_freq_table(s: pd.Series, sep=";") -> pd.DataFrame:
+    s2 = s.dropna().astype(str)
+    items = []
+    for cell in s2:
+        parts = [p.strip() for p in cell.split(sep) if p.strip()]
+        items.extend(parts)
+    if not items:
+        return pd.DataFrame(columns=["Option", "n", "%"])
+    c = Counter(items)
+    df = pd.DataFrame({"Option": list(c.keys()), "n": list(c.values())})
+    df = df.sort_values("n", ascending=False).reset_index(drop=True)
+    df["%"] = (df["n"] / df["n"].sum() * 100).round(1)
+    return df
+
+def single_select_freq_table(s: pd.Series) -> pd.DataFrame:
+    s2 = clean_cat_series(s)
+    vc = s2.value_counts(dropna=False).reset_index()
+    vc.columns = ["Option", "n"]
+    vc["%"] = (vc["n"] / vc["n"].sum() * 100).round(1)
+    return vc
+
+def open_end_theme_bullets(texts: list[str], top_k=5) -> list[str]:
+    # resumen simple (sin LLM): top términos (filtra stopwords básicas)
+    stop = set(["the","and","to","of","in","for","a","an","is","it","on","that","this","with","as","are","be","at","by","or","from"])
+    tokens = []
+    for t in texts:
+        t = re.sub(r"[^a-zA-Z0-9\s]", " ", t.lower())
+        toks = [w for w in t.split() if len(w) >= 3 and w not in stop]
+        tokens.extend(toks)
+    if not tokens:
+        return []
+    common = [w for w,_ in Counter(tokens).most_common(top_k)]
+    return [f"Frequent theme/term: **{w}**" for w in common]
+
+def is_open_end_col(colname: str, s: pd.Series) -> bool:
+    name = colname.lower()
+    if ("other" in name and "specify" in name) or ("please specify" in name) or ("open" in name) or ("comments" in name):
+        return True
+    # fallback: muchas categorías únicas y textos largos
+    s2 = s.dropna().astype(str)
+    if s2.empty:
+        return False
+    return (s2.nunique() / max(1, len(s2)) > 0.6) and (s2.str.len().median() >= 20)
+
+
+from scipy.stats import fisher_exact, mannwhitneyu, kruskal, spearmanr
+
+def fisher_or_chi2(ct: pd.DataFrame) -> dict:
+    """
+    Fisher exact SOLO 2x2 con scipy.
+    Para RxC, devolvemos chi2 como fallback + nota (porque exact RxC no está en scipy).
+    """
+    out = {"test": None, "p": np.nan, "note": "", "effect": {}}
+    if ct.shape == (2, 2):
+        oddsratio, p = fisher_exact(ct.values)
+        out["test"] = "Fisher exact (2x2)"
+        out["p"] = p
+        out["effect"] = {"odds_ratio": float(oddsratio)}
+        return out
+    else:
+        chi2, p, dof, _ = chi2_contingency(ct.values)
+        out["test"] = "Chi-square (fallback; Fisher exact RxC not in scipy)"
+        out["p"] = p
+        out["note"] = "If you require Fisher-Freeman-Halton exact (RxC), we can add a dedicated library."
+        out["effect"] = {"chi2": float(chi2), "dof": int(dof)}
+        return out
+
+def likert_group_test(values: pd.Series, groups: pd.Series) -> dict:
+    """
+    Mann-Whitney U for 2 groups, Kruskal-Wallis for 3+.
+    """
+    tmp = pd.DataFrame({"y": pd.to_numeric(values, errors="coerce"), "g": clean_cat_series(groups)})
+    tmp = tmp.dropna(subset=["y", "g"])
+    tmp = tmp[tmp["g"] != "Unknown"]
+    levels = tmp["g"].unique().tolist()
+
+    out = {"test": None, "p": np.nan, "k": len(levels), "effect": {}}
+    if len(levels) < 2:
+        return out
+
+    samples = [tmp[tmp["g"] == lv]["y"].values for lv in levels]
+    if len(levels) == 2:
+        u, p = mannwhitneyu(samples[0], samples[1], alternative="two-sided")
+        out["test"] = "Mann-Whitney U"
+        out["p"] = p
+        out["effect"] = {"U": float(u), "median_diff": float(np.median(samples[0]) - np.median(samples[1]))}
+        return out
+    else:
+        h, p = kruskal(*samples)
+        out["test"] = "Kruskal-Wallis"
+        out["p"] = p
+        out["effect"] = {"H": float(h)}
+        return out
+
+def spearman_matrix_with_p_n(df: pd.DataFrame, cols: list[str], min_pairwise_n: int = 8):
+    """
+    Returns:
+      r_mat: Spearman r
+      p_mat: p-values
+      n_mat: pairwise n used
+    """
+    X = df[cols].apply(pd.to_numeric, errors="coerce")
+
+    r_mat = pd.DataFrame(index=cols, columns=cols, dtype=float)
+    p_mat = pd.DataFrame(index=cols, columns=cols, dtype=float)
+    n_mat = pd.DataFrame(index=cols, columns=cols, dtype=float)
+
+    for i, a in enumerate(cols):
+        for j, b in enumerate(cols):
+            if i == j:
+                r_mat.loc[a, b] = 1.0
+                p_mat.loc[a, b] = 0.0
+                n_mat.loc[a, b] = X[a].notna().sum()
+            elif j < i:
+                # mirror lower triangle
+                r_mat.loc[a, b] = r_mat.loc[b, a]
+                p_mat.loc[a, b] = p_mat.loc[b, a]
+                n_mat.loc[a, b] = n_mat.loc[b, a]
+            else:
+                tmp = X[[a, b]].dropna()
+                n = len(tmp)
+                n_mat.loc[a, b] = n
+
+                if n < min_pairwise_n:
+                    r_mat.loc[a, b] = np.nan
+                    p_mat.loc[a, b] = np.nan
+                else:
+                    r, p = spearmanr(tmp[a], tmp[b])
+                    r_mat.loc[a, b] = r
+                    p_mat.loc[a, b] = p
+
+    return r_mat, p_mat, n_mat
+
+def build_frequency_frames(df: pd.DataFrame, sep=";"):
+    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    # excluye grouping vars si existen
+    exclude = {ROLE_GROUP_COL, TENURE_GROUP_COL, REGION_GROUP_COL, TRAINING_BIN_COL}
+    cat_cols = [c for c in cat_cols if c not in exclude]
+
+    singles = []
+    multis = []
+    openraw = []
+
+    for c in cat_cols:
+        s = df[c]
+        if is_open_end_col(c, s):
+            texts = s.dropna().astype(str).str.strip()
+            texts = texts[texts != ""].tolist()
+            for t in texts:
+                openraw.append({"question": c, "response": t})
+            continue
+
+        if is_multiselect_col(s, sep=sep):
+            ft = multiselect_freq_table(s, sep=sep)
+            for _, r in ft.iterrows():
+                multis.append({"question": c, "option": r["Option"], "n": int(r["n"]), "%": float(r["%"])})
+        else:
+            ft = single_select_freq_table(s)
+            for _, r in ft.iterrows():
+                singles.append({"question": c, "option": r["Option"], "n": int(r["n"]), "%": float(r["%"])})
+
+    return (
+        pd.DataFrame(singles),
+        pd.DataFrame(multis),
+        pd.DataFrame(openraw),
+    )
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+def write_df(ws, df: pd.DataFrame, title: str = None):
+    if title:
+        ws.append([title])
+        ws.append([])
+    for r in dataframe_to_rows(df, index=False, header=True):
+        ws.append(r)
+
+def build_master_report_excel(
+    df: pd.DataFrame,
+    top_findings_df: pd.DataFrame,
+    sep: str,
+    likert_cols: list[str],
+    min_pairwise: int
+) -> bytes:
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # Frequencies
+    single_df, multi_df, open_df = build_frequency_frames(df, sep=sep)
+
+    ws1 = wb.create_sheet("Frequencies_Single")
+    write_df(ws1, single_df)
+
+    ws2 = wb.create_sheet("Frequencies_Multi")
+    write_df(ws2, multi_df)
+
+    ws3 = wb.create_sheet("OpenEnds_Raw")
+    write_df(ws3, open_df)
+
+    # Top10
+    ws4 = wb.create_sheet("Top10_Findings")
+    write_df(ws4, top_findings_df if top_findings_df is not None else pd.DataFrame())
+
+    # Correlation
+    if len(likert_cols) >= 2:
+        r_mat, p_mat, n_mat = spearman_matrix_with_p_n(df_f, cols_use, min_pairwise_n=min_pairwise)
+
+        # Use existing corr excel builder logic but write into this workbook
+        ws_r = wb.create_sheet("Spearman_r")
+        ws_r.append([""] + list(r_mat.columns))
+        for idx in r_mat.index:
+            ws_r.append([idx] + [None if pd.isna(v) else float(v) for v in r_mat.loc[idx].values])
+
+        for i in range(len(r_mat.index)):
+            for j in range(len(r_mat.columns)):
+                p = p_mat.iat[i, j]
+                cell = ws_r.cell(row=2 + i, column=2 + j)
+                if pd.isna(p):
+                    continue
+                if p < 0.05:
+                    cell.fill = GREEN
+                elif p < 0.10:
+                    cell.fill = YELLOW
+
+        ws_p = wb.create_sheet("Spearman_p")
+        ws_p.append([""] + list(p_mat.columns))
+        for idx in p_mat.index:
+            ws_p.append([idx] + [None if pd.isna(v) else float(v) for v in p_mat.loc[idx].values])
+
+        ws_n = wb.create_sheet("Pairwise_n")
+        ws_n.append([""] + list(n_mat.columns))
+        for idx in n_mat.index:
+            ws_n.append([idx] + [None if pd.isna(v) else float(v) for v in n_mat.loc[idx].values])
+
+    # Appendix
+    wsA = wb.create_sheet("Appendix")
+    wsA.append(["Technical Appendix"])
+    wsA.append(["Software", "Python + pandas + scipy + streamlit + openpyxl"])
+    wsA.append(["Cleaning", "Trim strings; blank/nan/None -> Unknown; optional drop Unknown in tests"])
+    wsA.append(["Tests", "Spearman rho (Likert/ordinal); Fisher exact (2x2) or Chi-square fallback; Mann-Whitney (2 groups); Kruskal-Wallis (3+)"])
+    wsA.append(["Significance", "Green: p<0.05; Yellow: p<0.10"])
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # p<0.05
+YELLOW = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid") # p<0.10
+
+def build_corr_excel(r_mat: pd.DataFrame, p_mat: pd.DataFrame, n_mat: pd.DataFrame) -> bytes:
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "Spearman_r"
+    ws.append([""] + list(r_mat.columns))
+    for idx in r_mat.index:
+        ws.append([idx] + [None if pd.isna(v) else float(v) for v in r_mat.loc[idx].values])
+
+    for i in range(len(r_mat.index)):
+        for j in range(len(r_mat.columns)):
+            p = p_mat.iat[i, j]
+            cell = ws.cell(row=2 + i, column=2 + j)
+            if pd.isna(p):
+                continue
+            if p < 0.05:
+                cell.fill = GREEN
+            elif p < 0.10:
+                cell.fill = YELLOW
+
+    ws2 = wb.create_sheet("Spearman_p")
+    ws2.append([""] + list(p_mat.columns))
+    for idx in p_mat.index:
+        ws2.append([idx] + [None if pd.isna(v) else float(v) for v in p_mat.loc[idx].values])
+
+    ws3 = wb.create_sheet("Pairwise_n")
+    ws3.append([""] + list(n_mat.columns))
+    for idx in n_mat.index:
+        ws3.append([idx] + [None if pd.isna(v) else float(v) for v in n_mat.loc[idx].values])
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
 
 # -----------------------------
 # UI: Sidebar
@@ -185,14 +644,14 @@ def plot_pct_heatmap(pct: pd.DataFrame, title: str, max_rows=25, max_cols=12):
 st.title("Survey EDA Dashboard (Interactive)")
 
 st.sidebar.header("Data Source")
-path = st.sidebar.text_input("CSV path", value=DEFAULT_PATH)
-uploaded = st.sidebar.file_uploader("...or upload a CSV", type=["csv"])
+uploaded = st.sidebar.file_uploader("Upload CSV (required)", type=["csv"])
 
-if uploaded is not None:
-    df = pd.read_csv(uploaded)
-    df = strip_strings(df)
-else:
-    df = load_data(path)
+if uploaded is None:
+    st.warning("⬅️ Please upload a CSV using the sidebar to start the dashboard.")
+    st.stop()
+
+df = pd.read_csv(uploaded)
+df = strip_strings(df)
 
 st.sidebar.header("Filters")
 sel_region = select_filter(REGION_COL, df)
@@ -213,6 +672,8 @@ for col, sel in [
     if sel is not None and col in df_f.columns:
         df_f = df_f[df_f[col].replace({np.nan: "Unknown"}).astype(str).isin(sel)]
 
+df_f = add_group_vars(df_f)
+
 st.caption(f"Rows after filters: {len(df_f)} / {len(df)}")
 
 with st.expander("Preview data"):
@@ -222,9 +683,14 @@ with st.expander("Preview data"):
 # -----------------------------
 # Tabs
 # -----------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "Univariate", "Bivariate", "Correlations", "Geo / Map", "XTab Report", "Visual XTab Matrix"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    "Univariate", "Bivariate", "Correlations", "Geo / Map",
+    "XTab Report", "Visual XTab Matrix",
+    "Baseline Report", "Group Tests + Top Findings",
+    "Correlation Matrix"
 ])
+
+
 
 # -----------------------------
 # Tab 1: Univariate
@@ -320,51 +786,35 @@ with tab2:
 # Tab 3: Correlations
 # -----------------------------
 with tab3:
-    st.subheader("Correlations / Associations")
+    st.subheader("Correlation Matrix (Spearman) + Export")
 
-    st.markdown("**Numeric–Numeric:** Spearman correlation (good for Likert / non-normal).")
-    num_cols = df_f.select_dtypes(include=["number"]).columns.tolist()
+    likert_cols = detect_likert_cols(df_f)
+    st.write(f"Detected Likert/ordinal (1–5) columns: {len(likert_cols)}")
 
-    if len(num_cols) >= 2:
-        corr = df_f[num_cols].corr(method="spearman")
-        st.dataframe(corr, use_container_width=True)
+    min_nonnull = st.slider("Min non-null pairs required", 5, 50, 10)
+    cols_use = []
+    for c in likert_cols:
+        if pd.to_numeric(df_f[c], errors="coerce").notna().sum() >= min_nonnull:
+            cols_use.append(c)
 
-        corr_pairs = (
-            corr.abs()
-                .where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-                .stack()
-                .sort_values(ascending=False)
-                .head(25)
-        )
-        st.write("Top absolute Spearman correlations:")
-        st.dataframe(
-            corr_pairs.rename("abs_corr").reset_index()
-                      .rename(columns={"level_0": "var1", "level_1": "var2"}),
-            use_container_width=True
-        )
+    if len(cols_use) < 2:
+        st.info("Not enough Likert/ordinal columns with sufficient data.")
     else:
-        st.info("Not enough numeric columns to compute correlations.")
+        r_mat, p_mat, n_mat = spearman_matrix_with_p_n(df_f, cols_use)
 
-    st.markdown("**Categorical–Categorical:** Cramér’s V (top pairs).")
-    cat_cols = df_f.select_dtypes(include=["object"]).columns.tolist()
-    cat_cols = [c for c in cat_cols if 2 <= df_f[c].nunique(dropna=True) <= 25]
+        st.markdown("### Spearman r (colored by p-value thresholds)")
+        # display r matrix; you already have Plotly/Go if you want heatmap
+        st.dataframe(r_mat.round(3), use_container_width=True)
 
-    if len(cat_cols) >= 2:
-        pairs = []
-        for i in range(len(cat_cols)):
-            for j in range(i + 1, len(cat_cols)):
-                a, b = cat_cols[i], cat_cols[j]
-                v = cramers_v(
-                    df_f[a].replace({np.nan: "Unknown"}),
-                    df_f[b].replace({np.nan: "Unknown"})
-                )
-                if not np.isnan(v):
-                    pairs.append((a, b, v))
+        xls = build_corr_excel(r_mat, p_mat, n_mat)
+        st.download_button(
+            "Download correlation matrix (Excel)",
+            data=xls,
+            file_name="spearman_matrix_with_pvalues.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-        pairs = sorted(pairs, key=lambda t: t[2], reverse=True)[:25]
-        st.dataframe(pd.DataFrame(pairs, columns=["var1", "var2", "cramers_v"]), use_container_width=True)
-    else:
-        st.info("Not enough categorical columns to compute Cramér’s V.")
+        st.caption("Color rule: green p<0.05, yellow p<0.10. Values are Spearman r.")
 
 
 # -----------------------------
@@ -587,3 +1037,281 @@ with tab6:
                         )
                     except Exception as e:
                         st.warning(f"Could not plot {q} × {b}: {e}")
+
+with tab7:
+    st.subheader("Baseline Report (all questions)")
+
+    cat_cols = df_f.select_dtypes(include=["object"]).columns.tolist()
+
+    # Excluir columnas internas / grouping
+    exclude = {ROLE_GROUP_COL, TENURE_GROUP_COL, REGION_GROUP_COL, TRAINING_BIN_COL}
+    cat_cols = [c for c in cat_cols if c not in exclude]
+
+    sep = st.text_input("Multi-select separator", value=";")
+    show_charts = st.checkbox("Show charts for single-select", value=True)
+
+    for c in cat_cols:
+        st.markdown(f"### {c}")
+
+        s = df_f[c]
+        if is_open_end_col(c, s):
+            st.markdown("**Open-end / Other specify**")
+            texts = s.dropna().astype(str).str.strip()
+            texts = texts[texts != ""].tolist()
+
+            if len(texts) == 0:
+                st.info("No responses.")
+                continue
+
+            st.write(f"Responses (raw): {len(texts)}")
+            st.dataframe(pd.DataFrame({"response": texts}), use_container_width=True, height=220)
+
+            bullets = open_end_theme_bullets(texts, top_k=5)
+            if bullets:
+                st.markdown("**Common themes (quick scan):**")
+                for b in bullets[:5]:
+                    st.write(f"- {b}")
+            continue
+
+        if is_multiselect_col(s, sep=sep):
+            st.markdown("**Multi-select frequency table**")
+            ms = multiselect_freq_table(s, sep=sep)
+            st.dataframe(ms, use_container_width=True)
+        else:
+            ft = single_select_freq_table(s)
+            st.dataframe(ft, use_container_width=True)
+            if show_charts:
+                # bar chart
+                top_k = min(20, len(ft))
+                ft2 = ft.head(top_k)
+                fig = plt.figure(figsize=(10, 4))
+                plt.bar(ft2["Option"].astype(str), ft2["n"].astype(int))
+                plt.xticks(rotation=30, ha="right")
+                plt.title(f"Counts: {c} (top {top_k})")
+                plt.tight_layout()
+                st.pyplot(fig)
+
+with tab8:
+    st.subheader("Segmented Group Comparisons + Top Findings")
+
+    grouping_vars = {
+        "Role (3 groups)": ROLE_GROUP_COL,
+        "Tenure (<5 vs >=5)": TENURE_GROUP_COL,
+        "AI Training (Yes/No)": TRAINING_BIN_COL,
+        "Region (US vs Other)": REGION_GROUP_COL,
+    }
+
+    g_label = st.selectbox("Grouping variable", list(grouping_vars.keys()), index=0)
+    gcol = grouping_vars[g_label]
+
+    # Detect Likert cols (1-5) across all columns, not only numeric
+    likert_cols = detect_likert_cols(df_f)
+    cat_cols = df_f.select_dtypes(include=["object"]).columns.tolist()
+
+    # Candidate outcomes:
+    outcome_type = st.radio("Outcome type", ["Categorical outcome (Fisher/Chi2)", "Likert/Ordinal outcome (MWU/KW)"], index=0)
+
+    findings = []
+
+    if outcome_type.startswith("Categorical"):
+        # Excluir grouping vars del outcome
+        exclude = {ROLE_GROUP_COL, TENURE_GROUP_COL, REGION_GROUP_COL, TRAINING_BIN_COL}
+        candidates = [c for c in cat_cols if c not in exclude and c != gcol]
+
+        outcome = st.selectbox("Categorical outcome variable", candidates, index=0 if candidates else None)
+        if outcome:
+            tmp = df_f[[outcome, gcol]].copy()
+            tmp[outcome] = clean_cat_series(tmp[outcome])
+            tmp[gcol] = clean_cat_series(tmp[gcol])
+            tmp = tmp[(tmp[outcome] != "Unknown") & (tmp[gcol] != "Unknown")]
+
+            ct = pd.crosstab(tmp[outcome], tmp[gcol])
+            st.markdown("### Contingency table (counts)")
+            st.dataframe(ct, use_container_width=True)
+
+            res = fisher_or_chi2(ct)
+            st.write(f"Test: **{res['test']}**, p = **{res['p']:.4f}**")
+            if res.get("note"):
+                st.caption(res["note"])
+            if res["effect"]:
+                st.json(res["effect"])
+
+    else:
+        # Likert outcome
+        outcome = st.selectbox("Likert/Ordinal outcome variable", likert_cols, index=0 if likert_cols else None)
+        if outcome:
+            res = likert_group_test(df_f[outcome], df_f[gcol])
+            st.write(f"Test: **{res['test']}**, p = **{res['p']:.4f}**, k={res['k']}")
+            if res["effect"]:
+                st.json(res["effect"])
+
+    st.divider()
+    st.markdown("### Top 10 significant findings (auto sweep)")
+
+    run_sweep = st.button("Run sweep across all outcomes")
+    alpha = st.selectbox("Significance threshold", [0.05, 0.10], index=0)
+
+    if run_sweep:
+        # Sweep: categorical outcomes
+        exclude = {ROLE_GROUP_COL, TENURE_GROUP_COL, REGION_GROUP_COL, TRAINING_BIN_COL}
+        candidates_cat = [c for c in cat_cols if c not in exclude]
+
+        for outc in candidates_cat:
+            if outc == gcol:
+                continue
+            tmp = df_f[[outc, gcol]].copy()
+            tmp[outc] = clean_cat_series(tmp[outc])
+            tmp[gcol] = clean_cat_series(tmp[gcol])
+            tmp = tmp[(tmp[outc] != "Unknown") & (tmp[gcol] != "Unknown")]
+            if tmp.empty:
+                continue
+            ct = pd.crosstab(tmp[outc], tmp[gcol])
+            if ct.shape[0] < 2 or ct.shape[1] < 2:
+                continue
+            r = fisher_or_chi2(ct)
+            if not np.isnan(r["p"]):
+                findings.append({
+                    "grouping": g_label,
+                    "outcome": outc,
+                    "type": "categorical",
+                    "test": r["test"],
+                    "p": r["p"],
+                })
+
+        # Sweep: likert outcomes
+        for outc in likert_cols:
+            r = likert_group_test(df_f[outc], df_f[gcol])
+            if r["test"] and not np.isnan(r["p"]):
+                findings.append({
+                    "grouping": g_label,
+                    "outcome": outc,
+                    "type": "likert",
+                    "test": r["test"],
+                    "p": r["p"],
+                })
+
+        #fdf = pd.DataFrame(findings).sort_values("p", ascending=True)
+
+
+        if len(findings) == 0:
+            st.info("No test results were generated (insufficient data after filtering / too many Unknown / no valid tables).")
+        else:
+            fdf = pd.DataFrame(findings)
+
+            # ensure column exists
+            if "p" not in fdf.columns:
+                st.warning(f"Unexpected findings schema. Columns found: {list(fdf.columns)}")
+                st.dataframe(fdf, use_container_width=True)
+            else:
+                fdf["p"] = pd.to_numeric(fdf["p"], errors="coerce")
+                fdf = fdf.dropna(subset=["p"]).sort_values("p", ascending=True)
+        
+                #fdf_sig = fdf[fdf["p"] < alpha].head(10)
+
+        if len(findings) == 0:
+            st.info("No test results were generated (insufficient data after filtering / too many Unknown / no valid tables).")
+            top10_df = pd.DataFrame()
+        else:
+            fdf = pd.DataFrame(findings)
+
+            if "p" not in fdf.columns:
+                st.warning(f"Unexpected findings schema. Columns found: {list(fdf.columns)}")
+                st.dataframe(fdf, use_container_width=True)
+                top10_df = pd.DataFrame()
+            else:
+                fdf["p"] = pd.to_numeric(fdf["p"], errors="coerce")
+                fdf = fdf.dropna(subset=["p"]).sort_values("p", ascending=True)
+
+                fdf_sig = fdf[fdf["p"] < alpha].head(10)
+
+                if fdf_sig.empty:
+                    st.info(f"No findings below p<{alpha}.")
+                    top10_df = pd.DataFrame()
+                else:
+                    st.dataframe(fdf_sig, use_container_width=True)
+                    top10_df = fdf_sig.copy()
+
+                with st.expander("Show top 50 (by p-value)"):
+                    st.dataframe(fdf.head(50), use_container_width=True)
+
+with tab9:
+    st.subheader("Spearman Correlation Matrix (Likert/Ordinal)")
+
+    likert_cols = detect_likert_cols(df_f)
+    st.write(f"Detected Likert/ordinal columns: **{len(likert_cols)}**")
+
+    min_nonnull = st.slider("Min non-null responses per variable", 5, 100, 10)
+    min_pairwise = st.slider("Min pairwise N to compute correlation", 5, 50, 8)
+
+    cols_use = []
+    for c in likert_cols:
+        nn = pd.to_numeric(df_f[c], errors="coerce").notna().sum()
+        if nn >= min_nonnull:
+            cols_use.append(c)
+
+    if len(cols_use) < 2:
+        st.info("Not enough Likert/ordinal columns after thresholds.")
+    else:
+        r_mat, p_mat, n_mat = spearman_matrix_with_p_n(df_f, cols_use, min_pairwise_n=min_pairwise)
+
+        xls = build_corr_excel(r_mat, p_mat, n_mat)
+
+
+        st.caption("Legend in cells: r value + ✓ (p<0.05) or • (p<0.10).")
+        fig = corr_heatmap_plotly(r_mat, p_mat, title="Spearman r (colored by magnitude) + significance markers")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Tables")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**r (Spearman)**")
+            st.dataframe(r_mat.round(3), use_container_width=True)
+        with c2:
+            st.markdown("**p-values**")
+            st.dataframe(p_mat.round(4), use_container_width=True)
+
+        xls = build_corr_excel(r_mat, p_mat, n_mat)
+        st.download_button(
+            "Download Correlation Matrix (Excel)",
+            data=xls,
+            file_name="spearman_matrix_with_pvalues.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    sep = ";"  # o el que uses en UI
+    min_pairwise = 8
+
+    # Si ya calculas top10 en tab8, guarda el DF en una variable (ver nota abajo)
+    # top10_df = ...
+
+    if st.button("Build & Download Master Spreadsheet"):
+
+        st.divider()
+        st.subheader("Deliverables (Phase 1)")
+
+        sep_deliv = st.text_input("Multi-select separator for deliverables", value=";")
+        min_pairwise_master = st.slider("Min pairwise N (correlations) for deliverables", 5, 50, 8)
+
+        if st.button("Build Deliverables (Excel)"):
+            likert_master = detect_likert_cols(df_f)
+            likert_master = [c for c in likert_master if pd.to_numeric(df_f[c], errors="coerce").notna().sum() >= 10]
+
+            try:
+                _top10 = top10_df
+            except NameError:
+                _top10 = pd.DataFrame()
+
+            xls_bytes = build_master_report_excel(
+                df=df_f,
+                top_findings_df=_top10,
+                sep=sep_deliv,
+                likert_cols=likert_master,
+                min_pairwise=min_pairwise_master
+            )
+
+            st.download_button(
+                "Download Deliverables – AiRHUB Phase 1 (Excel)",
+                data=xls_bytes,
+                file_name="AiRHUB_Phase1_Deliverables.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
