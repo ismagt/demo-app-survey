@@ -1,22 +1,22 @@
 # ============================================================
-# Survey EDA Dashboard (Streamlit)
-# - Cleans/ignores survey metadata columns (Start Date, IP, etc.)
-# - XTab All Qs (Excel-style):
-#     * Streamlit preview as heatmap-like styled tables
-#     * Excel export with:
-#         - per-banner XTabs (column %)
-#         - heatmap conditional formatting
-#         - optional sig letters (a/b/c @95%, A/B/C @99%)
-#         - a question×banner association matrix (Cramer's V)
+# Survey EDA Dashboard (Streamlit) — app_eda_v4 FIXED
 #
-# IMPORTANT (your latest requirement):
-# - Tab 5 uses FIXED banner columns (your demographic/segment columns)
-# - The remaining questions become the rows (all other categorical variables)
+# Fixes your two recurring errors:
+# 1) ValueError: clean_cat_series expected 1 column, got 2
+# 2) ValueError: Buffer has wrong number of dimensions (expected 1, got 2)
+#
+# Root cause: your CSV can contain DUPLICATE column names.
+# In pandas, df["colname"] may return a DataFrame (2+ cols) instead of a Series.
+# This breaks clean_cat_series() and pd.crosstab().
+#
+# This version introduces safe_get_series() and uses it everywhere.
+#
+# Also: includes Score as a QUESTION ROW in Tab 5 + Excel Index.
+# (We create "Score (quiz) band" and we include that as a row-question AND banner if present.)
 # ============================================================
 
 import re
 from io import BytesIO
-from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
 
-from scipy.stats import chi2_contingency, spearmanr, fisher_exact, mannwhitneyu, kruskal
+from scipy.stats import chi2_contingency
 
 # -----------------------------
 # Optional Excel export deps
@@ -52,6 +52,9 @@ TRAINING_COL = "Have you or your agency participated in any formal training or w
 POSITION_COL = "Which best describes your position level within your regulatory agency?"
 YEARS_COL = "How many years have you worked in a regulatory role with oversight of the gambling/gaming industry?"
 
+SCORE_COL = "Score"
+SCORE_BAND_COL = "Score (quiz) band"
+
 ISO3_COL_CANDIDATES = ["iso3", "ISO3", "ISO_3", "country_iso3"]
 
 ROLE_GROUP_COL = "role_group"
@@ -60,6 +63,7 @@ REGION_GROUP_COL = "region_group"
 TRAINING_BIN_COL = "training_bin"
 
 # Columns to remove from analysis/presentation (clutter)
+# IMPORTANT: Do NOT drop SCORE_COL; we use it to build SCORE_BAND_COL.
 DROP_COLS = {
     "Start Date",
     "End Date",
@@ -75,40 +79,60 @@ DROP_COLS = {
     "Q_DuplicateRespondent",
     "Are you currently employed by a gambling regulatory agency, commission, authority, or equivalent public body?",
     "Do you agree to participate in this research study based on the information provided above?",
-    "Score",
     "Source",
     "Create New Field or Choose From Dropdown...",
     "Q_UnansweredPercentage",
     "Q_UnansweredQuestions",
 }
 
-# FIXED banner columns you requested for the top row (Tab 5)
+# FIXED banner columns (Tab 5 columns)
 FIXED_BANNERS = [
     "Please select your age range.",
     "Please indicate your gender. - Selected Choice",
     "Please indicate your gender. - Prefer to self-describe: - Text",
     "Please indicate your ethnicity or race (select all that apply): - Selected Choice",
     "Please indicate your ethnicity or race (select all that apply): - Another race or ethnicity (please specify): - Text",
-    "Which region best represents the primary jurisdiction of your regulatory agency?",
-    "Which best describes your position level within your regulatory agency?",
+    REGION_COL,
+    POSITION_COL,
     "Which division or primary area do you currently work in? - Selected Choice",
     "Which division or primary area do you currently work in? - Other (please specify): - Text",
-    "How many years have you worked in a regulatory role with oversight of the gambling/gaming industry?",
+    YEARS_COL,
+    SCORE_BAND_COL,  # keep score band as a banner if present
 ]
 
-# Excel styling fills (when openpyxl available)
+# Excel styling fills
 if OPENPYXL_OK:
-    GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")   # p<0.05
-    YELLOW = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid") # p<0.10
     HEADER_FILL = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     SECTION_FILL = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     BOLD = Font(bold=True)
 
 # ============================================================
-# Cleaning utilities
+# Robust helpers for duplicate-column CSVs
 # ============================================================
 
-def clean_cat_series(s: pd.Series) -> pd.Series:
+def safe_get_series(df: pd.DataFrame, colname: str) -> pd.Series:
+    """
+    Always return a 1D Series for a column name, even if df has duplicate column names.
+    - If duplicates: take the FIRST occurrence.
+    - If missing: return a Series of NaN with the right length.
+    """
+    if colname not in df.columns:
+        return pd.Series([np.nan] * len(df), index=df.index, name=colname)
+
+    out = df.loc[:, colname]  # can be Series or DataFrame if duplicates
+    if isinstance(out, pd.DataFrame):
+        out = out.iloc[:, 0]   # take first duplicate
+        out.name = colname
+    return out
+
+def clean_cat_series(x) -> pd.Series:
+    """
+    Accept Series OR single-column DataFrame; returns clean categorical Series.
+    If DataFrame with multiple cols sneaks in, we take the first.
+    """
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0]
+    s = x.copy()
     s = s.replace({np.nan: "Unknown"}).astype(str).str.strip()
     return s.replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"})
 
@@ -116,19 +140,29 @@ def strip_strings(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df.copy()
     obj_cols = df2.select_dtypes(include=["object"]).columns
     for c in obj_cols:
-        df2[c] = (
-            df2[c]
-            .astype(str)
-            .str.strip()
-            .replace({"": np.nan, "nan": np.nan, "None": np.nan})
-        )
+        # Use loc[:, c] in case duplicates exist: it returns DataFrame; we handle both.
+        col = df2.loc[:, c]
+        if isinstance(col, pd.DataFrame):
+            # strip each duplicate column
+            for j in range(col.shape[1]):
+                df2.iloc[:, df2.columns.get_loc(c)[j] if isinstance(df2.columns.get_loc(c), slice) else df2.columns.get_loc(c)] = (
+                    col.iloc[:, j].astype(str).str.strip().replace({"": np.nan, "nan": np.nan, "None": np.nan})
+                )
+        else:
+            df2[c] = col.astype(str).str.strip().replace({"": np.nan, "nan": np.nan, "None": np.nan})
     return df2
 
 def coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     df2 = df.copy()
     for c in cols:
         if c in df2.columns:
-            df2[c] = pd.to_numeric(df2[c], errors="coerce")
+            col = df2.loc[:, c]
+            if isinstance(col, pd.DataFrame):
+                # coerce each duplicate
+                for j in range(col.shape[1]):
+                    df2.loc[:, c].iloc[:, j] = pd.to_numeric(col.iloc[:, j], errors="coerce")
+            else:
+                df2[c] = pd.to_numeric(col, errors="coerce")
     return df2
 
 def robust_barh(labels: pd.Series, values: pd.Series, title: str, xlabel: str):
@@ -146,18 +180,67 @@ def robust_barh(labels: pd.Series, values: pd.Series, title: str, xlabel: str):
     st.pyplot(fig)
 
 def select_filter(colname: str, df: pd.DataFrame):
+    # must use safe_get_series because duplicates can exist
     if colname not in df.columns:
         return None
-    vals = df[colname].replace({np.nan: "Unknown"}).astype(str)
+    s = safe_get_series(df, colname)
+    vals = s.replace({np.nan: "Unknown"}).astype(str)
     options = sorted(vals.unique().tolist())
     selected = st.sidebar.multiselect(colname, options, default=options, key=f"filter_{colname}")
     return selected
 
 # ============================================================
+# Score band builder
+# ============================================================
+
+def add_score_band(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates SCORE_BAND_COL from SCORE_COL.
+    - If max >= 12 -> assume ~14-pt quiz: 0–4 / 5–9 / 10–14
+    - else terciles.
+    """
+    df2 = df.copy()
+    if SCORE_COL not in df2.columns:
+        return df2
+
+    score = pd.to_numeric(safe_get_series(df2, SCORE_COL), errors="coerce")
+    df2[SCORE_COL] = score
+    max_score = score.max()
+
+    if pd.isna(max_score):
+        df2[SCORE_BAND_COL] = "Unknown"
+        return df2
+
+    max_score = float(max_score)
+
+    if max_score >= 12:
+        def _band14(x):
+            if pd.isna(x): return "Unknown"
+            x = float(x)
+            if x <= 4: return "0–4 (Low)"
+            if x <= 9: return "5–9 (Medium)"
+            return "10–14 (High)"
+        df2[SCORE_BAND_COL] = score.map(_band14).astype(str).replace({"nan": "Unknown"}).fillna("Unknown")
+        return df2
+
+    b1 = max_score * 0.33
+    b2 = max_score * 0.66
+
+    def _band3(x):
+        if pd.isna(x): return "Unknown"
+        x = float(x)
+        if x <= b1: return f"Low (≤{b1:.0f})"
+        if x <= b2: return f"Medium ({b1:.0f}–{b2:.0f})"
+        return f"High (>{b2:.0f})"
+
+    df2[SCORE_BAND_COL] = score.map(_band3).astype(str).replace({"nan": "Unknown"}).fillna("Unknown")
+    return df2
+
+# ============================================================
 # Grouping helpers
 # ============================================================
 
-def recode_role(series: pd.Series) -> pd.Series:
+def recode_role(series) -> pd.Series:
     s = clean_cat_series(series)
     leadership = {"Executive Leadership", "Director", "Commissioner", "Chair", "CEO", "President"}
     management = {"Management", "Manager", "Supervisor", "Team Lead"}
@@ -170,18 +253,19 @@ def recode_role(series: pd.Series) -> pd.Series:
         return "Other/Unknown"
     return s.map(_map)
 
-def recode_training_yesno(series: pd.Series) -> pd.Series:
+def recode_training_yesno(series) -> pd.Series:
     s = clean_cat_series(series).str.lower()
     return s.map(lambda x: "Yes" if "yes" in x else ("No" if "no" in x else "Unknown"))
 
-def recode_region_us_other(series: pd.Series) -> pd.Series:
+def recode_region_us_other(series) -> pd.Series:
     s = clean_cat_series(series).str.lower()
     return s.map(lambda x: "US" if ("united states" in x or x == "us" or "u.s." in x) else ("Other" if x != "unknown" else "Unknown"))
 
-def recode_tenure_5yrs(series: pd.Series) -> pd.Series:
+def recode_tenure_5yrs(series) -> pd.Series:
     s = clean_cat_series(series).str.lower()
     less = {"0-2 years", "0–2 years", "1-2 years", "3-5 years", "3–5 years", "less than 5 years", "<5 years"}
     more = {"6-10 years", "6–10 years", "10+ years", "10 years or more", "more than 5 years", ">5 years"}
+
     def _map(x: str) -> str:
         if x in less: return "<5 years"
         if x in more: return ">=5 years"
@@ -190,10 +274,10 @@ def recode_tenure_5yrs(series: pd.Series) -> pd.Series:
 
 def add_group_vars(df: pd.DataFrame) -> pd.DataFrame:
     df2 = df.copy()
-    df2[ROLE_GROUP_COL] = recode_role(df2[POSITION_COL]) if POSITION_COL in df2.columns else "Unknown"
-    df2[TRAINING_BIN_COL] = recode_training_yesno(df2[TRAINING_COL]) if TRAINING_COL in df2.columns else "Unknown"
-    df2[REGION_GROUP_COL] = recode_region_us_other(df2[REGION_COL]) if REGION_COL in df2.columns else "Unknown"
-    df2[TENURE_GROUP_COL] = recode_tenure_5yrs(df2[YEARS_COL]) if YEARS_COL in df2.columns else "Unknown"
+    df2[ROLE_GROUP_COL] = recode_role(safe_get_series(df2, POSITION_COL)) if POSITION_COL in df2.columns else "Unknown"
+    df2[TRAINING_BIN_COL] = recode_training_yesno(safe_get_series(df2, TRAINING_COL)) if TRAINING_COL in df2.columns else "Unknown"
+    df2[REGION_GROUP_COL] = recode_region_us_other(safe_get_series(df2, REGION_COL)) if REGION_COL in df2.columns else "Unknown"
+    df2[TENURE_GROUP_COL] = recode_tenure_5yrs(safe_get_series(df2, YEARS_COL)) if YEARS_COL in df2.columns else "Unknown"
     return df2
 
 # ============================================================
@@ -208,51 +292,27 @@ def xtab_percent_table(
     drop_unknown_cols: bool = False,
     sort_rows_by_total: bool = False,
 ) -> pd.DataFrame:
-    tmp = df[[row_var, col_var]].copy()
-    tmp[row_var] = clean_cat_series(tmp[row_var])
-    tmp[col_var] = clean_cat_series(tmp[col_var])
+    r = clean_cat_series(safe_get_series(df, row_var))
+    c = clean_cat_series(safe_get_series(df, col_var))
+
+    tmp = pd.DataFrame({row_var: r, col_var: c}, index=df.index)
 
     if drop_unknown_rows:
         tmp = tmp[tmp[row_var] != "Unknown"]
     if drop_unknown_cols:
         tmp = tmp[tmp[col_var] != "Unknown"]
 
-    counts = pd.crosstab(tmp[row_var], tmp[col_var], dropna=False)
-    counts["Total"] = counts.sum(axis=1)
+    ct = pd.crosstab(tmp[row_var], tmp[col_var], dropna=False)
+    ct["Total"] = ct.sum(axis=1)
 
-    col_sums = counts.sum(axis=0).replace(0, np.nan)
-    pct = (counts / col_sums) * 100
+    col_sums = ct.sum(axis=0).replace(0, np.nan)
+    pct = (ct / col_sums) * 100
     pct = pct.round(1)
 
     if sort_rows_by_total:
         pct = pct.sort_values("Total", ascending=False)
 
     return pct
-
-def xtab_count_table(
-    df: pd.DataFrame,
-    row_var: str,
-    col_var: str,
-    drop_unknown_rows: bool = False,
-    drop_unknown_cols: bool = False,
-    sort_rows_by_total: bool = False,
-) -> pd.DataFrame:
-    tmp = df[[row_var, col_var]].copy()
-    tmp[row_var] = clean_cat_series(tmp[row_var])
-    tmp[col_var] = clean_cat_series(tmp[col_var])
-
-    if drop_unknown_rows:
-        tmp = tmp[tmp[row_var] != "Unknown"]
-    if drop_unknown_cols:
-        tmp = tmp[tmp[col_var] != "Unknown"]
-
-    counts = pd.crosstab(tmp[row_var], tmp[col_var], dropna=False)
-    counts["Total"] = counts.sum(axis=1)
-
-    if sort_rows_by_total:
-        counts = counts.sort_values("Total", ascending=False)
-
-    return counts
 
 def cramers_v_from_ct(ct: pd.DataFrame) -> float:
     if ct.shape[0] < 2 or ct.shape[1] < 2:
@@ -272,8 +332,7 @@ def cramers_v_from_ct(ct: pd.DataFrame) -> float:
     return float(np.sqrt(phi2corr / denom))
 
 # ============================================================
-# Significance letters (a/b/c and A/B/C)
-# Simple z-test on proportions within each banner column (approx)
+# Significance letters (optional) — kept from your version
 # ============================================================
 
 def _ztest_prop(p1, n1, p2, n2):
@@ -286,14 +345,14 @@ def _ztest_prop(p1, n1, p2, n2):
     if se == 0:
         return np.nan
     z = (p1 - p2) / se
-    # two-sided p-value approx (normal)
     from math import erf, sqrt
-    return 2 * (1 - 0.5*(1+erf(abs(z)/sqrt(2))))
+    return 2 * (1 - 0.5 * (1 + erf(abs(z) / sqrt(2))))
 
 def sig_letter_matrix(df: pd.DataFrame, row_var: str, col_var: str, alpha95=0.05, alpha99=0.01, drop_unknown=True) -> pd.DataFrame:
-    tmp = df[[row_var, col_var]].copy()
-    tmp[row_var] = clean_cat_series(tmp[row_var])
-    tmp[col_var] = clean_cat_series(tmp[col_var])
+    r = clean_cat_series(safe_get_series(df, row_var))
+    c = clean_cat_series(safe_get_series(df, col_var))
+    tmp = pd.DataFrame({row_var: r, col_var: c}, index=df.index)
+
     if drop_unknown:
         tmp = tmp[(tmp[row_var] != "Unknown") & (tmp[col_var] != "Unknown")]
 
@@ -307,29 +366,28 @@ def sig_letter_matrix(df: pd.DataFrame, row_var: str, col_var: str, alpha95=0.05
     cols = list(ct.columns)
     letters_95 = list("abcdefghijklmnopqrstuvwxyz")
     letters_99 = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
     out = pd.DataFrame("", index=ct.index, columns=ct.columns, dtype=object)
 
-    for c_idx, c in enumerate(cols):
-        for r in ct.index:
-            if pd.isna(col_totals[c]) or col_totals[c] == 0:
+    for c_idx, c0 in enumerate(cols):
+        for r0 in ct.index:
+            if pd.isna(col_totals[c0]) or col_totals[c0] == 0:
                 continue
-            p1 = pct.loc[r, c]
+            p1 = pct.loc[r0, c0]
             sig95, sig99 = [], []
             for c2_idx, c2 in enumerate(cols):
-                if c2 == c:
+                if c2 == c0:
                     continue
                 if pd.isna(col_totals[c2]) or col_totals[c2] == 0:
                     continue
-                p2 = pct.loc[r, c2]
-                pval = _ztest_prop(p1, float(col_totals[c]), p2, float(col_totals[c2]))
+                p2 = pct.loc[r0, c2]
+                pval = _ztest_prop(p1, float(col_totals[c0]), p2, float(col_totals[c2]))
                 if pd.isna(pval):
                     continue
                 if pval < alpha99:
                     sig99.append(letters_99[c2_idx % len(letters_99)])
                 elif pval < alpha95:
                     sig95.append(letters_95[c2_idx % len(letters_95)])
-            out.loc[r, c] = "".join(sig99 + sig95)
+            out.loc[r0, c0] = "".join(sig99 + sig95)
 
     return out
 
@@ -353,21 +411,18 @@ def build_xtab_allqs_excel(
     ws = wb.active
     ws.title = "XTab_AllQs"
 
-    # Title block
     ws.append(["XTab All Questions (Column %) — Excel-style"])
     ws["A1"].font = Font(bold=True, size=14)
     ws.append(["Notes:", "Each banner column sums to 100%. Heatmap highlights higher %."])
     ws.append(["Filters applied in Streamlit will affect this export."])
     ws.append([])
 
-    # Optional: index matrix (questions down, banners across) with hyperlinks
     ws_idx = wb.create_sheet("Index_Matrix")
     ws_idx.append(["Index: Questions × Banners (click to jump to the corresponding block)"])
     ws_idx["A1"].font = Font(bold=True, size=14)
     ws_idx.append([])
     start_row = ws_idx.max_row + 1
-    ws_idx.cell(row=start_row, column=1).value = "Question"
-    ws_idx.cell(row=start_row, column=1).fill = HEADER_FILL
+    ws_idx.cell(row=start_row, column=1, value="Question").fill = HEADER_FILL
     ws_idx.cell(row=start_row, column=1).font = BOLD
 
     for j, b in enumerate(banners, start=2):
@@ -376,7 +431,7 @@ def build_xtab_allqs_excel(
         c.font = BOLD
         c.alignment = Alignment(wrap_text=True, vertical="top")
 
-    anchor = {}  # (q, b) -> row number in XTab_AllQs
+    anchor = {}
 
     for q in questions:
         ws.append([q])
@@ -400,7 +455,7 @@ def build_xtab_allqs_excel(
                 sort_rows_by_total=True,
             )
 
-            banner_levels = pct_tbl.columns.tolist()  # includes Total
+            banner_levels = pct_tbl.columns.tolist()
             ws.append([None, None] + banner_levels)
             hdr_row = ws.max_row
             for col in range(1, ws.max_column + 1):
@@ -432,7 +487,7 @@ def build_xtab_allqs_excel(
                     if pd.isna(v):
                         cell.value = None
                     else:
-                        cell.value = float(v) / 100.0  # store as proportion for Excel %
+                        cell.value = float(v) / 100.0
                         cell.number_format = "0.0%"
                     cell.alignment = Alignment(vertical="top", wrap_text=True)
 
@@ -466,7 +521,7 @@ def build_xtab_allqs_excel(
         ws.column_dimensions[get_column_letter(col)].width = 14
     ws.freeze_panes = "A5"
 
-    # Index hyperlinks
+    # Index hyperlinks (Score band included because it's in `questions`)
     q_start = start_row + 1
     for i, q in enumerate(questions, start=q_start):
         c = ws_idx.cell(row=i, column=1, value=q)
@@ -489,7 +544,7 @@ def build_xtab_allqs_excel(
         ws_idx.column_dimensions[get_column_letter(j)].width = 22
     ws_idx.freeze_panes = ws_idx["B" + str(q_start)].coordinate
 
-    # Cramer's V matrix
+    # Cramer's V matrix sheet
     ws_v = wb.create_sheet("QxBanner_Assoc_V")
     ws_v.append(["Question × Banner association (Cramer's V)"])
     ws_v["A1"].font = Font(bold=True, size=14)
@@ -507,9 +562,9 @@ def build_xtab_allqs_excel(
     for q in questions:
         row = [q]
         for b in banners:
-            tmp = df[[q, b]].copy()
-            tmp[q] = clean_cat_series(tmp[q])
-            tmp[b] = clean_cat_series(tmp[b])
+            rq = clean_cat_series(safe_get_series(df, q))
+            rb = clean_cat_series(safe_get_series(df, b))
+            tmp = pd.DataFrame({q: rq, b: rb}, index=df.index)
             if drop_unknown:
                 tmp = tmp[(tmp[q] != "Unknown") & (tmp[b] != "Unknown")]
             ct = pd.crosstab(tmp[q], tmp[b], dropna=False)
@@ -545,7 +600,6 @@ st.title("Survey EDA Dashboard (Interactive)")
 
 st.sidebar.header("Data Source")
 uploaded = st.sidebar.file_uploader("Upload CSV (required)", type=["csv"], key="csv_uploader")
-
 if uploaded is None:
     st.warning("⬅️ Please upload a CSV using the sidebar to start the dashboard.")
     st.stop()
@@ -553,27 +607,30 @@ if uploaded is None:
 df = pd.read_csv(uploaded)
 df = strip_strings(df)
 
-# Drop clutter columns (global)
+# Drop clutter columns
 drop_present = [c for c in DROP_COLS if c in df.columns]
 if drop_present:
     df = df.drop(columns=drop_present)
 
-# Coerce numeric (safe if cols missing)
+# Coerce numeric (including Score)
 df = coerce_numeric(df, [
-    "Duration (in seconds)", "Progress", "Q_RecaptchaScore", "Score",
+    "Duration (in seconds)", "Progress", "Q_RecaptchaScore", SCORE_COL,
     "Q_UnansweredPercentage", "Q_UnansweredQuestions"
 ])
 
-# Fix known typo(s) in region
+# Fix known typo(s) in region (use safe_get_series)
 if REGION_COL in df.columns:
-    df[REGION_COL] = (
-        df[REGION_COL]
-        .replace({np.nan: "Unknown"})
-        .astype(str)
-        .str.strip()
-        .replace({"Asia-Paciifc": "Asia-Pacific", "nan": "Unknown", "": "Unknown"})
-    )
+    reg = safe_get_series(df, REGION_COL)
+    reg = reg.replace({np.nan: "Unknown"}).astype(str).str.strip().replace({"Asia-Paciifc": "Asia-Pacific", "nan": "Unknown", "": "Unknown"})
+    # assign back safely
+    df[REGION_COL] = reg
 
+# Build Score band (so Score appears as a row-question via band)
+df = add_score_band(df)
+
+# -----------------------------
+# Filters
+# -----------------------------
 st.sidebar.header("Filters")
 sel_region = select_filter(REGION_COL, df)
 sel_ai = select_filter(AI_USE_COL, df)
@@ -581,7 +638,6 @@ sel_training = select_filter(TRAINING_COL, df)
 sel_position = select_filter(POSITION_COL, df)
 sel_years = select_filter(YEARS_COL, df)
 
-# Apply filters
 df_f = df.copy()
 for col, sel in [
     (REGION_COL, sel_region),
@@ -591,7 +647,8 @@ for col, sel in [
     (YEARS_COL, sel_years),
 ]:
     if sel is not None and col in df_f.columns:
-        df_f = df_f[df_f[col].replace({np.nan: "Unknown"}).astype(str).isin(sel)]
+        s = safe_get_series(df_f, col).replace({np.nan: "Unknown"}).astype(str)
+        df_f = df_f[s.isin(sel)]
 
 df_f = add_group_vars(df_f)
 
@@ -622,7 +679,7 @@ with tab1:
         bins = st.slider("Bins", 5, 60, 20, key="univ_bins")
 
         fig = plt.figure(figsize=(8, 4))
-        x = df_f[col].dropna()
+        x = pd.to_numeric(safe_get_series(df_f, col), errors="coerce").dropna()
         plt.hist(x, bins=bins)
         plt.title(f"Histogram: {col}")
         plt.xlabel(col)
@@ -642,7 +699,8 @@ with tab1:
         st.info("No categorical columns detected.")
     else:
         cat = st.selectbox("Categorical variable", cat_cols, index=0, key="univ_cat_col")
-        vc = df_f[cat].replace({np.nan: "Unknown"}).astype(str).value_counts(dropna=False).reset_index()
+        s = safe_get_series(df_f, cat).replace({np.nan: "Unknown"}).astype(str)
+        vc = s.value_counts(dropna=False).reset_index()
         vc.columns = ["Category", "Count"]
         st.dataframe(vc, use_container_width=True)
         robust_barh(vc["Category"], vc["Count"], title=f"Counts: {cat}", xlabel="Count")
@@ -662,10 +720,10 @@ with tab2:
         y = st.selectbox("Numeric Y", num_cols, index=0, key="biv_y")
         x = st.selectbox("Categorical X", cat_cols, index=0, key="biv_x")
 
-        tmp = df_f[[x, y]].copy()
-        tmp[x] = tmp[x].replace({np.nan: "Unknown"}).astype(str)
-        tmp[y] = pd.to_numeric(tmp[y], errors="coerce")
-        tmp = tmp.dropna(subset=[y])
+        tmp = pd.DataFrame({
+            x: safe_get_series(df_f, x).replace({np.nan: "Unknown"}).astype(str),
+            y: pd.to_numeric(safe_get_series(df_f, y), errors="coerce"),
+        }, index=df_f.index).dropna(subset=[y])
 
         top_k = st.slider("Max categories to show (top-k)", 3, 25, 12, key="biv_topk")
         topcats = tmp[x].value_counts().head(top_k).index
@@ -692,30 +750,29 @@ with tab2:
             st.pyplot(fig)
 
 # -----------------------------
-# Tab 3: Correlations (Spearman)
+# Tab 3: Correlations (Spearman) — lightweight
 # -----------------------------
 with tab3:
     st.subheader("Correlation Matrix (Spearman)")
 
     likert_cols = []
     for c in df_f.columns:
-        s = df_f[c].dropna()
-        if s.empty:
+        s = pd.to_numeric(safe_get_series(df_f, c), errors="coerce")
+        if s.notna().sum() == 0:
             continue
-        numeric = pd.to_numeric(s, errors="coerce")
-        ok = numeric.between(1, 5).mean()
+        ok = s.between(1, 5).mean()
         if ok >= 0.70:
             likert_cols.append(c)
 
     st.write(f"Detected Likert/ordinal (1–5) columns: {len(likert_cols)}")
 
     min_nonnull = st.slider("Min non-null responses per variable", 5, 100, 10, key="corr_min_nonnull")
-    cols_use = [c for c in likert_cols if pd.to_numeric(df_f[c], errors="coerce").notna().sum() >= min_nonnull]
+    cols_use = [c for c in likert_cols if pd.to_numeric(safe_get_series(df_f, c), errors="coerce").notna().sum() >= min_nonnull]
 
     if len(cols_use) < 2:
         st.info("Not enough Likert/ordinal columns after thresholds.")
     else:
-        X = df_f[cols_use].apply(pd.to_numeric, errors="coerce")
+        X = pd.DataFrame({c: pd.to_numeric(safe_get_series(df_f, c), errors="coerce") for c in cols_use})
         r_mat = X.corr(method="spearman")
         st.dataframe(r_mat.round(3), use_container_width=True)
 
@@ -727,12 +784,10 @@ with tab4:
 
     iso3_col = next((c for c in ISO3_COL_CANDIDATES if c in df_f.columns), None)
     if iso3_col:
-        tmp = df_f[[iso3_col]].copy()
-        tmp[iso3_col] = tmp[iso3_col].replace({np.nan: "Unknown"}).astype(str).str.strip()
-        tmp = tmp[tmp[iso3_col].str.len() == 3]
-        counts = tmp[iso3_col].value_counts().reset_index()
+        tmp = safe_get_series(df_f, iso3_col).replace({np.nan: "Unknown"}).astype(str).str.strip()
+        tmp = tmp[tmp.str.len() == 3]
+        counts = tmp.value_counts().reset_index()
         counts.columns = ["iso3", "respondents"]
-
         fig = px.choropleth(counts, locations="iso3", color="respondents", title="Respondents by Country (ISO3)")
         st.plotly_chart(fig, use_container_width=True)
     else:
@@ -740,15 +795,15 @@ with tab4:
 
 # -----------------------------
 # Tab 5: XTab All Qs (Excel-style) — FIXED banners
+# Includes Score band as a ROW QUESTION (and also as banner if present)
 # -----------------------------
 with tab5:
     st.subheader("Excel-style XTab (All Questions) — Preview + Export")
     st.caption("This tab excludes metadata columns automatically and uses your FIXED demographic banners as columns.")
 
-    # Work dataframe for XTab tab (already dropped global clutter above, but keep safe)
     df_work = df_f.drop(columns=[c for c in DROP_COLS if c in df_f.columns], errors="ignore")
 
-    # Banners = fixed list (only those present)
+    # Banners: fixed list (present only)
     banners = [c for c in FIXED_BANNERS if c in df_work.columns]
     if len(banners) == 0:
         st.error("None of the FIXED_BANNERS columns were found in the uploaded CSV. Check column names.")
@@ -757,12 +812,17 @@ with tab5:
     st.markdown("### Fixed banner columns (used as Excel columns)")
     st.write(banners)
 
-    # Questions = all other categorical columns (not in banners, not internal group vars)
+    # Questions: all other categorical columns (not in banners, not internal)
     exclude_internal = {ROLE_GROUP_COL, TENURE_GROUP_COL, REGION_GROUP_COL, TRAINING_BIN_COL}
     cat_cols = df_work.select_dtypes(include=["object"]).columns.tolist()
     cat_cols = [c for c in cat_cols if c not in exclude_internal]
 
     questions_all = [c for c in cat_cols if c not in set(banners)]
+
+    # FORCE: include Score band as a ROW QUESTION (even if it is also a banner)
+    if SCORE_BAND_COL in df_work.columns:
+        questions_all = [q for q in questions_all if q != SCORE_BAND_COL] + [SCORE_BAND_COL]
+
     if len(questions_all) == 0:
         st.warning("No remaining categorical question columns after applying fixed banners.")
         st.stop()
@@ -802,17 +862,17 @@ with tab5:
 
     st.divider()
 
-    # Matrix view inside Streamlit: Questions x Banners (Cramer's V)
+    # Matrix view: Questions x Banners (Cramer's V) — robust to duplicate columns
     st.markdown("### Question × Banner matrix (association)")
     st.caption("Cramer's V computed from the contingency table (after dropping Unknown if selected).")
 
     v_rows = []
     for q in questions_all:
         row = {"Question": q}
+        rq = clean_cat_series(safe_get_series(df_work, q))
         for b in banners:
-            tmp = df_work[[q, b]].copy()
-            tmp[q] = clean_cat_series(tmp[q])
-            tmp[b] = clean_cat_series(tmp[b])
+            rb = clean_cat_series(safe_get_series(df_work, b))
+            tmp = pd.DataFrame({q: rq, b: rb}, index=df_work.index)
             if drop_unknown:
                 tmp = tmp[(tmp[q] != "Unknown") & (tmp[b] != "Unknown")]
             ct = pd.crosstab(tmp[q], tmp[b], dropna=False)
@@ -828,7 +888,7 @@ with tab5:
 
     st.divider()
 
-    # Build full Excel report
+    # Excel export
     st.markdown("### Build full Excel report (All Questions × FIXED Banners)")
     if not OPENPYXL_OK:
         st.error("openpyxl is not installed in this environment. Add it to requirements.txt: openpyxl")
@@ -837,7 +897,7 @@ with tab5:
             xls_bytes = build_xtab_allqs_excel(
                 df=df_work,
                 banners=banners,
-                questions=questions_all,
+                questions=questions_all,  # includes Score band row
                 drop_unknown=drop_unknown,
                 show_sig=show_sig,
                 alpha95=alpha95,
@@ -852,7 +912,7 @@ with tab5:
             )
 
 # -----------------------------
-# Tab 6: Visual XTab Matrix (Plotly) — optional interactive
+# Tab 6: Visual XTab Matrix (Plotly)
 # -----------------------------
 with tab6:
     st.subheader("Visual XTab Matrix (colored % heatmaps)")
@@ -865,35 +925,35 @@ with tab6:
         st.info("Need at least two categorical columns.")
     else:
         default_banners = [c for c in [REGION_COL, POSITION_COL, AI_USE_COL, TRAINING_COL, YEARS_COL] if c in cat_cols]
-        banners = st.multiselect(
+        banners_sel = st.multiselect(
             "Banners (grouping variables)",
             options=cat_cols,
             default=default_banners[:3] if default_banners else cat_cols[:2],
             key="xtab_matrix_banners"
         )
 
-        candidate_questions = [c for c in cat_cols if c not in set(banners)]
-        questions = st.multiselect(
+        candidate_questions = [c for c in cat_cols if c not in set(banners_sel)]
+        questions_sel = st.multiselect(
             "Questions (to cross vs each banner)",
             options=candidate_questions,
             default=candidate_questions[:3] if len(candidate_questions) >= 3 else candidate_questions,
             key="xtab_matrix_questions"
         )
 
-        drop_unknown = st.checkbox("Drop Unknown (recommended)", value=True, key="xtab_matrix_drop_unknown")
+        drop_unknown2 = st.checkbox("Drop Unknown (recommended)", value=True, key="xtab_matrix_drop_unknown")
         max_rows = st.slider("Max response options (rows) per heatmap", 5, 60, 25, key="xtab_matrix_max_rows")
         max_cols = st.slider("Max banner categories (cols) per heatmap", 3, 30, 12, key="xtab_matrix_max_cols")
 
-        if len(banners) == 0 or len(questions) == 0:
+        if len(banners_sel) == 0 or len(questions_sel) == 0:
             st.info("Select at least 1 banner and 1 question.")
         else:
-            for q in questions:
+            for q in questions_sel:
                 st.markdown(f"## {q}")
-                for b in banners:
+                for b in banners_sel:
                     try:
                         pct = xtab_percent_table(
                             df_f, row_var=q, col_var=b,
-                            drop_unknown_rows=drop_unknown, drop_unknown_cols=drop_unknown,
+                            drop_unknown_rows=drop_unknown2, drop_unknown_cols=drop_unknown2,
                             sort_rows_by_total=True
                         )
 
